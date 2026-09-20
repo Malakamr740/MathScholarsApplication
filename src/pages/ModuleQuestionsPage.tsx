@@ -36,6 +36,8 @@ export const ModuleQuestionsPage: React.FC = () => {
   const [assessment, setAssessment] = useState<Assessment | null>(null)
   const [section, setSection] = useState<AssessmentSection | null>(null)
   const [questions, setQuestions] = useState<QuestionBankItem[]>([])
+  const [bankQuestions, setBankQuestions] = useState<QuestionBankItem[]>(() => questionBankService.getStoredQuestions())
+  const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
 
@@ -53,26 +55,55 @@ export const ModuleQuestionsPage: React.FC = () => {
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false)
   const [tempSettings, setTempSettings] = useState<SectionSettings | null>(null)
 
-  const loadData = () => {
-    if (!assessmentId || !moduleId) return
-    const a = assessmentService.getAssessmentById(assessmentId)
-    if (!a) {
-      setError(`Assessment "${assessmentId}" not found.`)
-      return
-    }
-    setAssessment(a)
-    const sec = a.sections.find((s) => s.id === moduleId)
-    if (!sec) {
-      setError(`Section "${moduleId}" not found in assessment.`)
-      return
-    }
-    setSection(sec)
-    setQuestions([...sec.questions])
-    setTempSettings({ ...sec.settings })
-  }
-
   useEffect(() => {
+    let isMounted = true
+
+    const loadData = async () => {
+      if (!assessmentId || !moduleId) return
+      let a = assessmentService.getAssessmentById(assessmentId)
+      if (!a) {
+        a = await assessmentService.fetchAssessmentById(assessmentId)
+      }
+      if (!isMounted) return
+
+      if (!a) {
+        setError(`Assessment "${assessmentId}" not found.`)
+        setIsLoading(false)
+        return
+      }
+      setAssessment(a)
+      const sec = a.sections.find((s) => s.id === moduleId)
+      if (!sec) {
+        setError(`Section "${moduleId}" not found in assessment.`)
+        setIsLoading(false)
+        return
+      }
+      setSection(sec)
+      setQuestions([...sec.questions])
+      setTempSettings({ ...sec.settings })
+      setBankQuestions(questionBankService.getStoredQuestions())
+      setIsLoading(false)
+    }
+
     loadData()
+
+    const unsubAssess = assessmentService.subscribe(() => {
+      if (isMounted) {
+        loadData()
+      }
+    })
+
+    const unsubBank = questionBankService.subscribe(() => {
+      if (isMounted) {
+        setBankQuestions(questionBankService.getStoredQuestions())
+      }
+    })
+
+    return () => {
+      isMounted = false
+      unsubAssess()
+      unsubBank()
+    }
   }, [assessmentId, moduleId])
 
   const notify = (msg: string) => {
@@ -149,6 +180,21 @@ export const ModuleQuestionsPage: React.FC = () => {
     }
   }
 
+  if (isLoading) {
+    return (
+      <AdminLayout
+        title="Module Questions"
+        showBackButton
+        backButtonPath={`/admin/assessments/${assessmentId || ''}`}
+      >
+        <div className="p-12 text-center bg-white rounded-2xl border border-slate-200 space-y-3">
+          <Clock className="h-8 w-8 text-blue-600 animate-spin mx-auto" />
+          <p className="text-xs text-slate-500 font-semibold">Loading Module Details...</p>
+        </div>
+      </AdminLayout>
+    )
+  }
+
   if (!assessment || !section) {
     return (
       <AdminLayout
@@ -172,7 +218,6 @@ export const ModuleQuestionsPage: React.FC = () => {
   }
 
   // Filter bank questions
-  const bankQuestions = questionBankService.getStoredQuestions()
   const existingIds = new Set(questions.map((q) => q.id))
 
   const filteredBank = bankQuestions.filter((bq) => {

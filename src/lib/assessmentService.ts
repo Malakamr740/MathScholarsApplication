@@ -1,4 +1,5 @@
 import { questionBankService, QuestionBankItem } from './questionBankService'
+import { supabase, isSupabaseConfigured } from './supabaseClient'
 
 export type TimingMode = 'timed' | 'untimed' | 'per_question'
 export type CalculatorType = 'none' | 'desmos' | 'scientific' | 'basic'
@@ -52,8 +53,7 @@ export interface Assessment {
   attemptsCount?: number
 }
 
-const STORAGE_KEY = 'math_diag_assessments_v3'
-const SEEDED_FLAG = 'math_diag_assessments_seeded_v3'
+const STORAGE_KEY = 'math_diag_assessments_cache_v4'
 
 export const DEFAULT_SECTION_SETTINGS: SectionSettings = {
   timingMode: 'timed',
@@ -74,203 +74,151 @@ export const DEFAULT_ASSESSMENT_SETTINGS: AssessmentSettings = {
   requirePhone: false,
   requireStudentId: false,
   showResultsImmediately: true,
-  enablePostSurvey: true,
+  enablePostSurvey: false,
   shuffleSections: false,
 }
 
 class AssessmentService {
   private assessments: Assessment[] | null = null
+  private listeners: (() => void)[] = []
+  private isSyncing = false
 
-  private getInitialAssessments(): Assessment[] {
-    const bank = questionBankService.getStoredQuestions()
-    const now = new Date().toISOString()
+  constructor() {
+    // Initial async sync from database
+    setTimeout(() => {
+      this.syncWithSupabase()
+    }, 0)
+  }
 
-    const qSet1 = bank.slice(0, 12)
-    const qSet2 = bank.slice(12, 25)
-    const qSet3 = bank.slice(25, 35)
-    const qSet4 = bank.slice(35, 45)
-    const qSet5 = bank.slice(45, 55)
+  subscribe(listener: () => void): () => void {
+    this.listeners.push(listener)
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== listener)
+    }
+  }
 
-    const algebra1: Assessment = {
-      id: 'diagnostic-algebra-1',
-      title: 'High School Algebra I Benchmark Diagnostic',
-      code: 'ALG1-BENCH-2026',
-      description:
-        'Official benchmark assessing linear equations, inequalities, polynomial operations, systems, and quadratic functions in accordance with standardized college readiness benchmarks.',
-      level: 'Grade 9-10',
-      targetExam: 'EST 1 / SAT Math',
-      status: 'active',
-      attemptsCount: 142,
-      createdAt: now,
-      updatedAt: now,
-      settings: {
-        ...DEFAULT_ASSESSMENT_SETTINGS,
-        passingScorePct: 70,
-      },
-      sections: [
-        {
-          id: 'sec-alg1-m1',
-          title: 'Section 1: Linear Systems & Foundations (No Calculator)',
-          description:
-            'Heart of Algebra, single-variable inequalities, slope equations, and system substitution. Calculators are strictly prohibited for this section.',
-          orderIndex: 0,
-          settings: {
-            timingMode: 'timed',
-            timeLimitMinutes: 20,
-            calculatorType: 'none',
-            navigationMode: 'free',
-            shuffleQuestions: false,
-            allowReviewBeforeSubmit: true,
-            breakAfterSectionMinutes: 5,
-          },
-          questions: qSet1.length > 0 ? qSet1 : bank.slice(0, 5),
-        },
-        {
-          id: 'sec-alg1-m2',
-          title: 'Section 2: Quadratics, Radicals & Applied Modeling (Calculator Active)',
-          description:
-            'Factoring, vertex form transformations, discriminant testing, and quadratic models. Desmos graphing calculator toolbar is available.',
-          orderIndex: 1,
-          settings: {
-            timingMode: 'timed',
-            timeLimitMinutes: 25,
-            calculatorType: 'desmos',
-            navigationMode: 'free',
-            shuffleQuestions: false,
-            allowReviewBeforeSubmit: true,
-            breakAfterSectionMinutes: 0,
-          },
-          questions: qSet2.length > 0 ? qSet2 : bank.slice(5, 12),
-        },
-      ],
+  private notifyListeners(): void {
+    this.listeners.forEach((l) => {
+      try {
+        l()
+      } catch (e) {
+        console.error('Error in assessmentService listener:', e)
+      }
+    })
+  }
+
+  async syncWithSupabase(): Promise<Assessment[]> {
+    if (!isSupabaseConfigured) {
+      this.assessments = []
+      return []
     }
 
-    const precalc: Assessment = {
-      id: 'pre-calculus-readiness',
-      title: 'Pre-Calculus & Functions Readiness Evaluation',
-      code: 'PREC-EVAL-2026',
-      description:
-        'Comprehensive multi-section diagnostic testing mastery of trigonometric identities, logarithms, exponential transformations, and rational functions.',
-      level: 'Grade 11-12',
-      targetExam: 'EST 2 Math Level 1',
-      status: 'active',
-      attemptsCount: 89,
-      createdAt: now,
-      updatedAt: now,
-      settings: {
-        ...DEFAULT_ASSESSMENT_SETTINGS,
-        passingScorePct: 75,
-      },
-      sections: [
-        {
-          id: 'sec-prec-m1',
-          title: 'Section 1: Trigonometric Formulations & Unit Circle',
-          description:
-            'Radian measures, unit circle evaluation, exact trigonometric ratios, and trigonometric equations.',
-          orderIndex: 0,
+    if (this.isSyncing) return this.assessments || []
+    this.isSyncing = true
+
+    try {
+      const { data: dbAssessments, error: aError } = await supabase
+        .from('assessments')
+        .select('*')
+        .order('created_at', { ascending: false })
+
+      if (aError || !dbAssessments) {
+        console.warn('Could not fetch assessments from Supabase:', aError?.message)
+        this.isSyncing = false
+        return this.assessments || []
+      }
+
+      // Fetch modules
+      const { data: dbModules } = await supabase
+        .from('modules')
+        .select('*')
+        .order('display_order', { ascending: true })
+
+      // Fetch attempts count per assessment
+      const { data: dbAttempts } = await supabase
+        .from('attempts')
+        .select('assessment_id')
+
+      const attemptsCountMap = new Map<string, number>()
+      dbAttempts?.forEach((att) => {
+        if (att.assessment_id) {
+          attemptsCountMap.set(att.assessment_id, (attemptsCountMap.get(att.assessment_id) || 0) + 1)
+        }
+      })
+
+      const modulesByAssessment = new Map<string, any[]>()
+      dbModules?.forEach((m) => {
+        if (m.assessment_id) {
+          const existing = modulesByAssessment.get(m.assessment_id) || []
+          existing.push(m)
+          modulesByAssessment.set(m.assessment_id, existing)
+        }
+      })
+
+      const bank = questionBankService.getStoredQuestions()
+      const bankMap = new Map<string, QuestionBankItem>()
+      bank.forEach((q) => bankMap.set(q.id, q))
+
+      const result: Assessment[] = dbAssessments.map((a) => {
+        const rawModules = modulesByAssessment.get(a.id) || []
+        const sections: AssessmentSection[] = rawModules.map((m, idx) => ({
+          id: m.id,
+          title: m.name || `Section ${idx + 1}`,
+          description: m.description || '',
+          orderIndex: m.display_order ?? idx,
           settings: {
-            timingMode: 'timed',
-            timeLimitMinutes: 20,
-            calculatorType: 'none',
-            navigationMode: 'free',
-            shuffleQuestions: false,
-            allowReviewBeforeSubmit: true,
-            breakAfterSectionMinutes: 5,
-          },
-          questions: qSet3.length > 0 ? qSet3 : bank.slice(0, 6),
-        },
-        {
-          id: 'sec-prec-m2',
-          title: 'Section 2: Logarithms & Exponential Models',
-          description:
-            'Properties of logs, compound growth, exponential decay, and change of base transformations.',
-          orderIndex: 1,
-          settings: {
-            timingMode: 'timed',
-            timeLimitMinutes: 20,
+            timingMode: m.timing_enabled ? 'timed' : 'untimed',
+            timeLimitMinutes: m.time_limit_minutes || 25,
             calculatorType: 'desmos',
             navigationMode: 'free',
-            shuffleQuestions: false,
+            shuffleQuestions: Boolean(m.shuffle_questions),
             allowReviewBeforeSubmit: true,
             breakAfterSectionMinutes: 0,
           },
-          questions: qSet4.length > 0 ? qSet4 : bank.slice(6, 12),
-        },
-        {
-          id: 'sec-prec-m3',
-          title: 'Section 3: Rational Functions & Domain Constraints',
-          description:
-            'Vertical asymptotes, holes, horizontal asymptotes, and rational equation solving.',
-          orderIndex: 2,
-          settings: {
-            timingMode: 'timed',
-            timeLimitMinutes: 20,
-            calculatorType: 'scientific',
-            navigationMode: 'free',
-            shuffleQuestions: true,
-            allowReviewBeforeSubmit: true,
-            breakAfterSectionMinutes: 0,
-          },
-          questions: qSet5.length > 0 ? qSet5 : bank.slice(12, 18),
-        },
-      ],
-    }
+          questions: [],
+        }))
 
-    const geometry: Assessment = {
-      id: 'geometry-mid-year',
-      title: 'Geometric Proofs and Congruence Diagnostic',
-      code: 'GEO-MID-2026',
-      description:
-        'Diagnostic assessment measuring spatial reasoning, coordinate proofs, arc sectors, and three-dimensional volume formulas.',
-      level: 'Grade 10',
-      targetExam: 'Standard Common Core',
-      status: 'active',
-      attemptsCount: 56,
-      createdAt: now,
-      updatedAt: now,
-      settings: {
-        ...DEFAULT_ASSESSMENT_SETTINGS,
-        passingScorePct: 65,
-      },
-      sections: [
-        {
-          id: 'sec-geo-m1',
-          title: 'Section 1: Geometric Proofs, Similarity & Angles',
-          description:
-            'Triangle congruence criteria, parallel transversal angles, and polygonal deductions without calculator.',
-          orderIndex: 0,
+        return {
+          id: a.id,
+          title: a.name,
+          code: `ASSESS-${a.id.slice(0, 6).toUpperCase()}`,
+          description: a.description || '',
+          level: 'EST 1 / High School',
+          targetExam: 'EST 1 Math',
+          status: a.status === 'published' ? 'active' : 'draft',
+          attemptsCount: attemptsCountMap.get(a.id) || 0,
           settings: {
-            timingMode: 'timed',
-            timeLimitMinutes: 20,
-            calculatorType: 'none',
-            navigationMode: 'free',
-            shuffleQuestions: false,
-            allowReviewBeforeSubmit: true,
-            breakAfterSectionMinutes: 5,
+            ...DEFAULT_ASSESSMENT_SETTINGS,
+            instructions: a.instructions || DEFAULT_ASSESSMENT_SETTINGS.instructions,
           },
-          questions: bank.slice(10, 20),
-        },
-        {
-          id: 'sec-geo-m2',
-          title: 'Section 2: Circles, Coordinate Geometry & Volumes',
-          description:
-            'Standard circle equation, arc length, sector areas, and composite solids with Desmos calculator enabled.',
-          orderIndex: 1,
-          settings: {
-            timingMode: 'timed',
-            timeLimitMinutes: 25,
-            calculatorType: 'desmos',
-            navigationMode: 'free',
-            shuffleQuestions: false,
-            allowReviewBeforeSubmit: true,
-            breakAfterSectionMinutes: 0,
-          },
-          questions: bank.slice(20, 30),
-        },
-      ],
-    }
+          sections:
+            sections.length > 0
+              ? sections
+              : [
+                  {
+                    id: `sec-${a.id}-m1`,
+                    title: 'Section 1',
+                    description: '',
+                    orderIndex: 0,
+                    settings: { ...DEFAULT_SECTION_SETTINGS },
+                    questions: [],
+                  },
+                ],
+          createdAt: a.created_at,
+          updatedAt: a.updated_at,
+        }
+      })
 
-    return [algebra1, precalc, geometry]
+      this.assessments = result
+      this.persist(result)
+      this.isSyncing = false
+      this.notifyListeners()
+      return result
+    } catch (err) {
+      console.error('Error syncing assessments with Supabase:', err)
+      this.isSyncing = false
+      return this.assessments || []
+    }
   }
 
   private load(): Assessment[] {
@@ -278,23 +226,24 @@ class AssessmentService {
       const stored = localStorage.getItem(STORAGE_KEY)
       if (stored) {
         const parsed = JSON.parse(stored)
-        if (Array.isArray(parsed) && parsed.length > 0) {
+        if (Array.isArray(parsed)) {
           return parsed
         }
       }
     } catch (err) {
-      console.warn('Could not load assessments from storage', err)
+      console.warn('Could not load assessments from cache', err)
     }
 
-    const seeded = this.getInitialAssessments()
-    this.persist(seeded)
-    return seeded
+    // Trigger sync immediately and return empty array - NEVER return fake data!
+    setTimeout(() => {
+      this.syncWithSupabase()
+    }, 0)
+    return []
   }
 
   private persist(assessments: Assessment[]) {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(assessments))
-      localStorage.setItem(SEEDED_FLAG, 'true')
     } catch (err) {
       console.warn('Could not persist assessments to storage', err)
     }
@@ -307,8 +256,17 @@ class AssessmentService {
     return [...this.assessments]
   }
 
+  async fetchAssessments(): Promise<Assessment[]> {
+    return this.syncWithSupabase()
+  }
+
   getAssessmentById(id: string): Assessment | null {
     const list = this.getAllAssessments()
+    return list.find((a) => a.id === id) || null
+  }
+
+  async fetchAssessmentById(id: string): Promise<Assessment | null> {
+    const list = await this.syncWithSupabase()
     return list.find((a) => a.id === id) || null
   }
 
@@ -328,6 +286,40 @@ class AssessmentService {
 
     this.assessments = list
     this.persist(list)
+    this.notifyListeners()
+
+    // Persist to Supabase in background
+    if (isSupabaseConfigured) {
+      ;(async () => {
+        try {
+          await supabase.from('assessments').upsert({
+            id: assessment.id,
+            name: assessment.title,
+            description: assessment.description,
+            instructions: assessment.settings.instructions,
+            status: assessment.status === 'active' ? 'published' : 'draft',
+            updated_at: new Date().toISOString(),
+          })
+
+          for (const sec of assessment.sections) {
+            await supabase.from('modules').upsert({
+              id: sec.id,
+              assessment_id: assessment.id,
+              name: sec.title,
+              description: sec.description,
+              display_order: sec.orderIndex,
+              timing_enabled: sec.settings.timingMode === 'timed',
+              time_limit_minutes: sec.settings.timeLimitMinutes,
+              shuffle_questions: sec.settings.shuffleQuestions,
+              updated_at: new Date().toISOString(),
+            })
+          }
+        } catch (e) {
+          console.warn('Supabase assessment update error:', e)
+        }
+      })()
+    }
+
     return updated
   }
 
@@ -357,7 +349,7 @@ class AssessmentService {
           description: 'Core problem solving and diagnostic evaluation.',
           orderIndex: 0,
           settings: { ...DEFAULT_SECTION_SETTINGS },
-          questions: questionBankService.getStoredQuestions().slice(0, 5),
+          questions: [],
         },
       ],
     }
@@ -371,6 +363,13 @@ class AssessmentService {
     if (filtered.length !== list.length) {
       this.assessments = filtered
       this.persist(filtered)
+      this.notifyListeners()
+
+      if (isSupabaseConfigured) {
+        supabase.from('modules').delete().eq('assessment_id', id).then(() => {
+          supabase.from('assessments').delete().eq('id', id).then(() => {})
+        })
+      }
       return true
     }
     return false
@@ -384,6 +383,7 @@ class AssessmentService {
       list[idx].updatedAt = new Date().toISOString()
       this.assessments = list
       this.persist(list)
+      this.notifyListeners()
     }
   }
 
@@ -426,7 +426,7 @@ class AssessmentService {
       },
       questions: sectionData?.questions && sectionData.questions.length > 0
         ? sectionData.questions
-        : questionBankService.getStoredQuestions().slice(0, 3),
+        : [],
     }
 
     assessment.sections.push(newSection)

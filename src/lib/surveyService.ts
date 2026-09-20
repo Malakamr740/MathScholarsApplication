@@ -309,7 +309,7 @@ class SurveyService {
     } catch (e) {
       console.warn('Failed to read survey questions from localStorage', e)
     }
-    return DEFAULT_SURVEY_QUESTIONS
+    return []
   }
 
   private loadActionPlans(): ActionPlan[] {
@@ -321,7 +321,7 @@ class SurveyService {
     } catch (e) {
       console.warn('Failed to read action plans from localStorage', e)
     }
-    return DEFAULT_ACTION_PLANS
+    return []
   }
 
   private loadResponses(): Record<string, StudentSurveyResponse> {

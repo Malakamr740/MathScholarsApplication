@@ -34,6 +34,7 @@ export const TakeAssessmentPage: React.FC = () => {
   const [assessment, setAssessment] = useState<Assessment | null>(null)
   const [studentInfo, setStudentInfo] = useState<any>(null)
   const [sections, setSections] = useState<AssessmentSection[]>([])
+  const [isLoading, setIsLoading] = useState(true)
 
   // Test execution state
   const [currentSectionIdx, setCurrentSectionIdx] = useState(0)
@@ -54,39 +55,66 @@ export const TakeAssessmentPage: React.FC = () => {
 
   // Load intake & assessment
   useEffect(() => {
-    let intake: any = null
-    try {
-      const stored = localStorage.getItem(`student_intake_${attemptId}`)
-      if (stored) {
-        intake = JSON.parse(stored)
-        setStudentInfo(intake)
+    let isMounted = true
+
+    const load = async () => {
+      let intake: any = null
+      try {
+        const stored = localStorage.getItem(`student_intake_${attemptId}`)
+        if (stored) {
+          intake = JSON.parse(stored)
+          if (isMounted) setStudentInfo(intake)
+        }
+      } catch (err) {
+        console.warn('Could not read intake', err)
       }
-    } catch (err) {
-      console.warn('Could not read intake', err)
+
+      let all = assessmentService.getAllAssessments()
+      if (all.length === 0) {
+        all = await assessmentService.fetchAssessments()
+      }
+
+      if (!isMounted) return
+
+      let found: Assessment | null = null
+      if (intake?.assessmentId) {
+        found = all.find((a) => a.id === intake.assessmentId) || null
+      }
+      if (!found && all.length > 0) {
+        found = all[0]
+      }
+
+      if (found) {
+        setAssessment(found)
+        let secList = [...found.sections]
+        if (found.settings.shuffleSections) {
+          secList.sort(() => Math.random() - 0.5)
+        }
+        setSections(secList)
+
+        // Initialize first section timer
+        const firstSec = secList[0]
+        if (firstSec && firstSec.settings.timingMode === 'timed') {
+          setSecondsRemaining(firstSec.settings.timeLimitMinutes * 60)
+        }
+      }
+      setIsLoading(false)
     }
 
-    const all = assessmentService.getAllAssessments()
-    let found: Assessment | null = null
-    if (intake?.assessmentId) {
-      found = assessmentService.getAssessmentById(intake.assessmentId) || null
-    }
-    if (!found && all.length > 0) {
-      found = all[0]
-    }
+    load()
 
-    if (found) {
-      setAssessment(found)
-      let secList = [...found.sections]
-      if (found.settings.shuffleSections) {
-        secList.sort(() => Math.random() - 0.5)
+    const unsub = assessmentService.subscribe(() => {
+      if (isMounted) {
+        const all = assessmentService.getAllAssessments()
+        if (all.length > 0 && !assessment) {
+          load()
+        }
       }
-      setSections(secList)
+    })
 
-      // Initialize first section timer
-      const firstSec = secList[0]
-      if (firstSec && firstSec.settings.timingMode === 'timed') {
-        setSecondsRemaining(firstSec.settings.timeLimitMinutes * 60)
-      }
+    return () => {
+      isMounted = false
+      unsub()
     }
   }, [attemptId])
 
@@ -294,12 +322,35 @@ export const TakeAssessmentPage: React.FC = () => {
     }
   }
 
-  if (!assessment || !currentSection || !currentQuestion) {
+  if (isLoading) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
         <div className="max-w-md w-full bg-white rounded-2xl p-6 border border-slate-200 text-center space-y-3">
           <Clock className="h-8 w-8 text-blue-600 animate-spin mx-auto" />
           <p className="text-xs text-slate-500 font-semibold">Initializing Assessment Session...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!assessment || !currentSection || !currentQuestion) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-2xl p-8 border border-slate-200 text-center space-y-4">
+          <AlertCircle className="h-10 w-10 text-amber-500 mx-auto" />
+          <h3 className="text-sm font-bold text-slate-900">Assessment Content Not Available</h3>
+          <p className="text-xs text-slate-500">
+            {!assessment
+              ? 'No active assessment was found for this session.'
+              : 'This assessment does not currently have any active questions in this section.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => navigate('/')}
+            className="px-4 py-2 rounded-xl bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 transition cursor-pointer"
+          >
+            Return to Dashboard
+          </button>
         </div>
       </div>
     )
